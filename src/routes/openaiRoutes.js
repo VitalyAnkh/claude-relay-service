@@ -68,6 +68,53 @@ function extractCodexUsageHeaders(headers) {
   return hasData ? snapshot : null
 }
 
+function parseUpstreamBody(body) {
+  if (!body) {
+    return null
+  }
+
+  if (Buffer.isBuffer(body)) {
+    const text = body.toString('utf8')
+    try {
+      return JSON.parse(text)
+    } catch (error) {
+      logger.debug('Failed to parse buffer payload as JSON, returning raw text')
+      return text
+    }
+  }
+
+  if (typeof body === 'string') {
+    try {
+      return JSON.parse(body)
+    } catch (error) {
+      logger.debug('Failed to parse string payload as JSON, returning raw string')
+      return body
+    }
+  }
+
+  if (typeof body === 'object') {
+    return body
+  }
+
+  return null
+}
+
+function extractResetSecondsFromError(errorData) {
+  if (!errorData || typeof errorData !== 'object') {
+    return null
+  }
+
+  const candidate =
+    errorData?.error?.resets_in_seconds ?? errorData?.resets_in_seconds ?? errorData?.retry_after
+
+  if (candidate === undefined || candidate === null) {
+    return null
+  }
+
+  const parsed = Number(candidate)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
 async function applyRateLimitTracking(req, usageSummary, model, context = '') {
   if (!req.rateLimitInfo) {
     return
@@ -853,7 +900,228 @@ const handleResponses = async (req, res) => {
   }
 }
 
+const handleVideos = async (req, res) => {
+  let accountId = null
+  let accountType = 'openai'
+  let sessionHash = null
+
+  try {
+    const apiKeyData = req.apiKey || {}
+
+    if (!checkOpenAIPermissions(apiKeyData)) {
+      logger.security(
+        `🚫 API Key ${apiKeyData.id || 'unknown'} 缺少 OpenAI 权限，拒绝访问 ${req.originalUrl}`
+      )
+      return res.status(403).json({
+        error: {
+          message: 'This API key does not have permission to access OpenAI',
+          type: 'permission_denied',
+          code: 'permission_denied'
+        }
+      })
+    }
+
+    const sessionId =
+      req.headers['session_id'] ||
+      req.headers['x-session-id'] ||
+      req.body?.session_id ||
+      req.body?.conversation_id ||
+      null
+
+    sessionHash = sessionId ? crypto.createHash('sha256').update(sessionId).digest('hex') : null
+
+    const requestedModel = req.body?.model || null
+
+    const authResult = await getOpenAIAuthToken(apiKeyData, sessionHash, requestedModel)
+    accountId = authResult.accountId
+    accountType = authResult.accountType
+
+    if (accountType === 'openai-responses') {
+      logger.info(
+        `🎬 Forwarding Sora video request via OpenAI-Responses account ${authResult.accountId}`
+      )
+      await openaiResponsesRelayService.handleRequest(req, res, authResult.account, apiKeyData)
+      return
+    }
+
+    const accessToken = authResult.accessToken
+    if (!accessToken) {
+      const error = new Error('OpenAI access token missing for video request')
+      error.statusCode = 403
+      throw error
+    }
+
+    const incomingHeaders = req.headers || {}
+    const headers = {}
+    for (const key of Object.keys(incomingHeaders)) {
+      const value = incomingHeaders[key]
+      if (value !== undefined && value !== null) {
+        headers[key] = value
+      }
+    }
+
+    delete headers['content-length']
+
+    headers['authorization'] = `Bearer ${accessToken}`
+    headers['chatgpt-account-id'] =
+      authResult.account.accountId || authResult.account.chatgptUserId || accountId
+    headers['accept'] = 'application/json'
+    headers['content-type'] = 'application/json'
+    headers['host'] = 'chatgpt.com'
+    headers['origin'] = headers['origin'] || 'https://chatgpt.com'
+    headers['referer'] = headers['referer'] || 'https://chatgpt.com/'
+
+    const proxyAgent = createProxyAgent(authResult.proxy)
+
+    const axiosConfig = {
+      headers,
+      timeout: config.requestTimeout || 600000,
+      validateStatus: () => true
+    }
+
+    if (proxyAgent) {
+      axiosConfig.httpsAgent = proxyAgent
+      axiosConfig.proxy = false
+      logger.info(
+        `🌐 Using proxy for Sora video request: ${ProxyHelper.getProxyDescription(authResult.proxy)}`
+      )
+    }
+
+    logger.api(
+      `🎬 Forwarding Sora video creation via account ${authResult.account.name} (${accountId})`
+    )
+
+    const upstream = await axios.post(
+      'https://chatgpt.com/backend-api/videos',
+      req.body,
+      axiosConfig
+    )
+
+    const parsedData = parseUpstreamBody(upstream.data)
+
+    if (upstream.status === 429) {
+      logger.warn(`🚫 Rate limit detected for OpenAI account ${accountId} (Sora videos)`)
+      const resetsInSeconds = extractResetSecondsFromError(parsedData)
+      try {
+        await unifiedOpenAIScheduler.markAccountRateLimited(
+          accountId,
+          'openai',
+          sessionHash,
+          resetsInSeconds
+        )
+      } catch (markError) {
+        logger.error('❌ Failed to mark account rate limited for Sora videos:', markError)
+      }
+
+      return res.status(429).json(
+        parsedData || {
+          error: {
+            message: 'Rate limit exceeded',
+            type: 'rate_limit_error'
+          }
+        }
+      )
+    }
+
+    if (upstream.status === 401 || upstream.status === 402) {
+      const statusLabel = upstream.status === 401 ? '401错误' : '402错误'
+      const extraHint = upstream.status === 402 ? '，可能欠费' : ''
+      const reason = parsedData?.error?.message
+        ? `OpenAI账号认证失败（${statusLabel}${extraHint}）：${parsedData.error.message}`
+        : `OpenAI账号认证失败（${statusLabel}${extraHint}）`
+
+      try {
+        await unifiedOpenAIScheduler.markAccountUnauthorized(
+          accountId,
+          'openai',
+          sessionHash,
+          reason
+        )
+      } catch (markError) {
+        logger.error('❌ Failed to mark OpenAI account unauthorized (Sora videos):', markError)
+      }
+
+      return res.status(upstream.status).json(
+        parsedData || {
+          error: {
+            message: 'Authentication failed for OpenAI account',
+            type: 'unauthorized',
+            code: 'unauthorized'
+          }
+        }
+      )
+    }
+
+    if (upstream.status >= 400) {
+      logger.error(
+        `❌ Upstream Sora video request failed (${upstream.status}) for account ${accountId}`,
+        parsedData || upstream.data
+      )
+
+      return res.status(upstream.status).json(
+        parsedData || {
+          error: {
+            message: 'Upstream error',
+            status: upstream.status
+          }
+        }
+      )
+    }
+
+    const headersToForward = ['content-type', 'content-length', 'set-cookie', 'x-request-id']
+    headersToForward.forEach((key) => {
+      const value = upstream.headers?.[key]
+      if (value !== undefined) {
+        res.setHeader(key, value)
+      }
+    })
+
+    if (parsedData !== null && typeof parsedData === 'object') {
+      return res.status(upstream.status).json(parsedData)
+    }
+
+    return res.status(upstream.status).send(upstream.data)
+  } catch (error) {
+    logger.error('Proxy to ChatGPT videos endpoint failed:', error)
+    const status = error.statusCode || error.response?.status || 500
+    const parsedError = parseUpstreamBody(error.response?.data)
+
+    if ((status === 401 || status === 402) && accountId) {
+      const statusLabel = status === 401 ? '401错误' : '402错误'
+      const extraHint = status === 402 ? '，可能欠费' : ''
+      const reason = parsedError?.error?.message
+        ? `OpenAI账号认证失败（${statusLabel}${extraHint}）：${parsedError.error.message}`
+        : error.message
+          ? `OpenAI账号认证失败（${statusLabel}${extraHint}）：${error.message}`
+          : `OpenAI账号认证失败（${statusLabel}${extraHint}）`
+
+      try {
+        await unifiedOpenAIScheduler.markAccountUnauthorized(
+          accountId,
+          accountType || 'openai',
+          sessionHash,
+          reason
+        )
+      } catch (markError) {
+        logger.error('❌ Failed to mark OpenAI account unauthorized in video catch:', markError)
+      }
+    }
+
+    const fallbackPayload = parsedError || { error: { message: error.message || 'Internal error' } }
+
+    if (!res.headersSent) {
+      res.status(status).json(
+        typeof fallbackPayload === 'object'
+          ? fallbackPayload
+          : { error: { message: String(fallbackPayload) } }
+      )
+    }
+  }
+}
+
 // 注册两个路由路径，都使用相同的处理函数
+router.post('/videos', authenticateApiKey, handleVideos)
+router.post('/v1/videos', authenticateApiKey, handleVideos)
 router.post('/responses', authenticateApiKey, handleResponses)
 router.post('/v1/responses', authenticateApiKey, handleResponses)
 
